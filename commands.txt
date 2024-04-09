@@ -1,0 +1,35 @@
+apt-get install curl
+
+curl -sfL https://get.k3s.io | sh -
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+mkdir -p ~/.kube
+
+sudo k3s kubectl config view --raw | tee ~/.kube/config
+chmod 600 ~/.kube/config
+
+mkdir -p k3s-files/src
+
+sudo apt-get update && sudo apt-get install -y podman
+
+cd k3s-files
+podman build -t moja-webapp:latest .
+podman save moja-webapp:latest > ../moja-webapp.tar
+sudo k3s ctr images import ../moja-webapp.tar
+
+kubectl apply -f postgresql-pv.yaml
+kubectl apply -f postgresql-pvc.yaml
+kubectl apply -f postgresql-deployment.yaml
+kubectl apply -f postgresql-service.yaml
+kubectl apply -f role.yaml
+kubectl apply -f rolebinding.yaml
+kubectl apply -f serviceaccount.yaml
+kubectl apply -f webapp-deployment.yaml
+kubectl apply -f webapp-service.yaml
+
+POSTGRES_POD=$(kubectl get pod -l app=postgres -o jsonpath="{.items[0].metadata.name}")
+echo "Nazwa poda PostgreSQL: $POSTGRES_POD"
+
+kubectl exec $POSTGRES_POD -- psql -U yourdbuser -d yourdbname -c "CREATE TABLE examples (data TEXT);"
+kubectl exec $POSTGRES_POD -- psql -U yourdbuser -d yourdbname -c "INSERT INTO examples (data) VALUES ('Przykładowy wpis 1'), ('Przykładowy wpis 2');"
