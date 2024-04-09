@@ -1,0 +1,226 @@
+cat <<EOF > k3s-files/postgresql-pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/data"
+
+EOF
+
+cat <<EOF > k3s-files/Dockerfile
+FROM python:3.8-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install kubernetes
+COPY src/ .
+CMD ["python", "./app.py"]
+
+EOF
+
+cat <<EOF > k3s-files/postgresql-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:latest
+        env:
+        - name: POSTGRES_DB
+          value: "yourdbname"
+        - name: POSTGRES_USER
+          value: "yourdbuser"
+        - name: POSTGRES_PASSWORD
+          value: "yourdbpassword"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: postgres-storage
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+
+EOF
+
+cat <<EOF > k3s-files/postgresql-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+EOF
+
+cat <<EOF > k3s-files/postgresql-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+spec:
+  ports:
+  - port: 5432
+  selector:
+    app: postgres
+  type: ClusterIP
+
+EOF
+
+cat <<EOF > k3s-files/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: webapp-pod-manager-binding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: webapp-service-account
+roleRef:
+  kind: Role
+  name: pod-manager-role
+  apiGroup: rbac.authorization.k8s.io
+
+EOF
+
+cat <<EOF > k3s-files/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: pod-manager-role
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+
+EOF
+
+cat <<EOF > k3s-files/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp-service-account
+
+EOF
+
+cat <<EOF > k3s-files/webapp-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      serviceAccountName: webapp-service-account
+      containers:
+      - name: webapp
+        image: localhost/moja-webapp:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5000
+
+EOF
+
+cat <<EOF > k3s-files/webapp-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp-service
+spec:
+  ports:
+  - port: 5000
+  selector:
+    app: webapp
+  type: LoadBalancer
+
+EOF
+
+cat <<EOF > k3s-files/src/app.py
+from flask import Flask, request, render_template_string
+import psycopg2
+from kubernetes import client, config
+
+app = Flask(__name__)
+
+def get_data():
+    conn = psycopg2.connect(dbname='yourdbname', user='yourdbuser', password='yourdbpassword', host='postgres-service')
+    cur = conn.cursor()
+    cur.execute("SELECT data FROM examples")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+def delete_postgres_pod():
+    config.load_incluster_config()
+    v1 = client.CoreV1Api()
+    namespace = "default"
+    label_selector = "app=postgres"
+
+    pods = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items
+    for pod in pods:
+        print(f"Deleting pod: {pod.metadata.name}")
+        v1.delete_namespaced_pod(name=pod.metadata.name, namespace=namespace)
+
+@app.route('/')
+def homepage():
+    data = get_data()
+    data_list = "<ul>" + "".join([f"<li>{row[0]}</li>" for row in data]) + "</ul>"
+    return render_template_string("""
+        <h1>Przycisk do 'zabijania' bazy danych</h1>
+        <form action="/kill-db" method="post">
+            <input type="submit" value="Zabij bazę danych" />
+        </form>
+        <h2>Dane z bazy:</h2>
+        """ + data_list)
+
+@app.route('/kill-db', methods=['POST'])
+def kill_db():
+    delete_postgres_pod()
+    return 'PostgreSQL pod deletion initiated. It will be restarted automatically.'
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0')
+
+EOF
+
+cat <<EOF > k3s-files/requirements.txt
+flask
+psycopg2-binary
+kubernetes
+
+EOF
