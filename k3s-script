@@ -1,0 +1,317 @@
+#!/bin/bash
+
+# Instaluje narzędzie curl, niezbędne do pobierania plików z internetu
+apt-get install curl
+
+# Instalacja k3s, lekkiego dystrybucji Kubernetes
+curl -sfL https://get.k3s.io | sh -
+
+# Ustawienie zmiennej środowiskowej KUBECONFIG, aby korzystać z konfiguracji k3s bezpośrednio
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Tworzenie katalogu .kube w katalogu domowym użytkownika, aby przechować konfigurację kubectl
+mkdir -p ~/.kube
+
+# Kopiowanie konfiguracji k3s do nowo utworzonego katalogu i ustawienie odpowiednich uprawnień
+sudo k3s kubectl config view --raw | tee ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Tworzenie katalogu na pliki związane z projektem k3s
+mkdir -p k3s-files/src
+
+# Utworzenie PersistentVolume dla PostgreSQL, aby przechowywać dane na dysku
+cat <<EOF > k3s-files/postgresql-pv.yaml
+apiVersion: v1 # Wersja API Kubernetes
+kind: PersistentVolume # Rodzaj zasobu, tutaj wolumin stały
+metadata:
+  name: postgres-pv # Nazwa PersistentVolume
+  labels:
+    type: local # Etykieta określająca typ woluminu
+spec:
+  storageClassName: manual # Nazwa klasy magazynu, tutaj 'manual' oznacza statyczne przydzielenie PV
+  capacity:
+    storage: 1Gi # Pojemność magazynu, tutaj 1 GB
+  accessModes:
+    - ReadWriteOnce # Tryb dostępu, tutaj 'ReadWriteOnce' oznacza, że wolumin może być podłączony do odczytu/zapisu przez jeden węzeł
+  hostPath:
+    path: "/mnt/data" # Ścieżka na węźle, gdzie dane będą przechowywane fizycznie
+
+EOF
+
+# Utworzenie Dockerfile dla aplikacji webowej, zawierającego instrukcje budowy obrazu
+cat <<EOF > k3s-files/Dockerfile
+# Bazuje na oficjalnym obrazie Pythona 3.8 slim, który jest lekką wersją obrazu
+FROM python:3.8-slim
+# Ustawia /app jako katalog roboczy w kontenerze
+WORKDIR /app
+# Kopiuje plik requirements.txt do katalogu roboczego
+COPY requirements.txt .
+# Instaluje zależności zdefiniowane w pliku requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+# Dodatkowo instaluje klienta Kubernetes
+RUN pip install kubernetes
+# Kopiuje katalog src do katalogu roboczego
+COPY src/ .
+# Ustawia domyślną komendę uruchamianą w kontenerze
+CMD ["python", "./app.py"]
+
+EOF
+
+# Utworzenie Deploymentu dla PostgreSQL, w tym konfiguracja kontenera i woluminów
+cat <<EOF > k3s-files/postgresql-deployment.yaml
+apiVersion: apps/v1 # Wersja API dla zasobów Deployment
+kind: Deployment # Typ zasobu
+metadata:
+  name: postgres-deployment # Nazwa Deploymentu
+spec:
+  replicas: 1 # Liczba replik poda
+  selector:
+    matchLabels:
+      app: postgres # Selektor używany do identyfikacji podów, które będą zarządzane przez Deployment
+  template:
+    metadata:
+      labels:
+        app: postgres # Etykieta przypisana do poda; używana do powiązania Serwisu z Podami
+    spec:
+      containers:
+      - name: postgres # Nazwa kontenera w podzie
+        image: postgres:latest # Obraz kontenera, tutaj używamy najnowszej wersji PostgreSQL
+        env: # Zmienne środowiskowe przekazywane do kontenera
+        - name: POSTGRES_DB
+          value: "yourdbname" # Nazwa bazy danych
+        - name: POSTGRES_USER
+          value: "yourdbuser" # Nazwa użytkownika bazy danych
+        - name: POSTGRES_PASSWORD
+          value: "yourdbpassword" # Hasło do bazy danych
+        ports:
+        - containerPort: 5432 # Port, na którym nasłuchuje PostgreSQL
+        volumeMounts: # Miejsce montowania woluminów w kontenerze
+        - mountPath: /var/lib/postgresql/data
+          name: postgres-storage # Nazwa woluminu montowanego w kontenerze
+        livenessProbe: # Sonda sprawdzająca, czy kontener jest żywy
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - yourdbuser # Komenda sprawdzająca, czy PostgreSQL jest gotowy do przyjęcia połączeń
+          initialDelaySeconds: 30 # Początkowe opóźnienie przed uruchomieniem sondy
+          periodSeconds: 10 # Częstotliwość sprawdzania
+      volumes: # Definicja woluminów używanych w podzie
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc # Nazwa PersistentVolumeClaim, z którego ma korzystać ten pod
+EOF
+
+# Utworzenie PersistentVolumeClaim dla PostgreSQL, aby zarezerwować miejsce na dane
+cat <<EOF > k3s-files/postgresql-pvc.yaml
+apiVersion: v1 # Wersja API Kubernetes
+kind: PersistentVolumeClaim # Rodzaj zasobu, tutaj wniosek o wolumin stały
+metadata:
+  name: postgres-pvc # Nazwa PersistentVolumeClaim
+spec:
+  storageClassName: manual # Nazwa klasy magazynu, która została zdefiniowana w PV
+  accessModes:
+    - ReadWriteOnce # Tryb dostępu; wolumin może być podłączony do odczytu/zapisu przez jeden węzeł
+  resources:
+    requests:
+      storage: 1Gi # Ilość miejsca na magazyn, którego żądamy
+EOF
+
+# Utworzenie serwisu Kubernetes dla PostgreSQL, aby umożliwić komunikację z innymi podami
+cat <<EOF > k3s-files/postgresql-service.yaml
+apiVersion: v1 # Wersja API Kubernetes
+kind: Service # Rodzaj zasobu, tutaj usługa
+metadata:
+  name: postgres-service # Nazwa usługi
+spec:
+  ports:
+  - port: 5432 # Port, na którym usługa jest dostępna
+  selector:
+    app: postgres # Selektor używany do powiązania usługi z podami
+  type: ClusterIP # Typ usługi, ClusterIP oznacza, że usługa będzie dostępna wewnątrz klastra
+
+EOF
+
+# Utworzenie RoleBindingu, aby nadać uprawnienia naszej aplikacji do zarządzania podami
+cat <<EOF > k3s-files/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1 # Wersja API dla RBAC
+kind: RoleBinding # Rodzaj zasobu, tutaj przypisanie roli
+metadata:
+  name: webapp-pod-manager-binding # Nazwa przypisania roli
+  namespace: default # Przestrzeń nazw, w której obowiązuje to przypisanie
+subjects: # Podmioty, którym przyznaje się dostęp
+- kind: ServiceAccount # Typ podmiotu, tutaj konto usługi
+  name: webapp-service-account # Nazwa konta usługi
+roleRef: # Odwołanie do roli, która jest przyznawana
+  kind: Role # Typ odwołania, tutaj rola
+  name: pod-manager-role # Nazwa roli
+  apiGroup: rbac.authorization.k8s.io # Grupa API, z której pochodzi rola
+
+EOF
+
+# Utworzenie Roli określającej uprawnienia dla aplikacji do interakcji z podami
+cat <<EOF > k3s-files/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1 # Wersja API dla RBAC
+kind: Role # Rodzaj zasobu, tutaj rola
+metadata:
+  namespace: default # Przestrzeń nazw, dla której obowiązuje rola
+  name: pod-manager-role # Nazwa roli
+rules: # Reguły określające uprawnienia
+- apiGroups: [""] # Grupy API, na które reguły mają wpływ; puste oznacza rdzeń API Kubernetes
+  resources: ["pods"] # Zasoby, do których reguły się odnoszą
+  verbs: ["get", "list", "delete"] # Operacje, które są dozwolone na zasobach
+
+EOF
+
+# Utworzenie ServiceAccount dla naszej aplikacji
+cat <<EOF > k3s-files/serviceaccount.yaml
+apiVersion: v1 # Wersja API Kubernetes
+kind: ServiceAccount # Rodzaj zasobu, tutaj konto usługi
+metadata:
+  name: webapp-service-account # Nazwa konta usługi
+
+EOF
+
+# Utworzenie Deploymentu dla naszej aplikacji webowej
+cat <<EOF > k3s-files/webapp-deployment.yaml
+apiVersion: apps/v1 # Wersja API dla Deployment
+kind: Deployment # Typ zasobu
+metadata:
+  name: webapp-deployment # Nazwa Deploymentu
+spec:
+  replicas: 1 # Liczba replik poda
+  selector:
+    matchLabels:
+      app: webapp # Selektor używany do identyfikacji podów, które będą zarządzane przez Deployment
+  template:
+    metadata:
+      labels:
+        app: webapp # Etykieta przypisana do poda; używana do powiązania Serwisu z Podami
+    spec:
+      serviceAccountName: webapp-service-account # Nazwa konta usługi używanego przez pod
+      containers:
+      - name: webapp # Nazwa kontenera w podzie
+        image: localhost/moja-webapp:latest # Obraz kontenera, wskazujący na zbudowany lokalnie obraz
+        imagePullPolicy: IfNotPresent # Polityka pobierania obrazu, nie pobiera jeśli obraz jest już lokalnie
+        ports:
+        - containerPort: 5000 # Port, na którym nasłuchuje aplikacja
+
+EOF
+
+# Utworzenie serwisu Kubernetes dla naszej aplikacji webowej
+cat <<EOF > k3s-files/webapp-service.yaml
+apiVersion: v1 # Wersja API Kubernetes
+kind: Service # Rodzaj zasobu, tutaj usługa
+metadata:
+  name: webapp-service # Nazwa usługi
+spec:
+  ports:
+  - port: 5000 # Port, na którym usługa jest dostępna
+  selector:
+    app: webapp # Selektor używany do powiązania usługi z podami
+  type: LoadBalancer # Typ usługi, LoadBalancer oznacza, że usługa będzie dostępna z zewnątrz klastra
+
+EOF
+
+# Plik app.py naszej aplikacji, zawierający logikę biznesową
+cat <<EOF > k3s-files/src/app.py
+from flask import Flask, request, render_template_string # Importowanie Flask i innych narzędzi do tworzenia aplikacji webowej
+import psycopg2 # Importowanie biblioteki do połączenia z bazą danych PostgreSQL
+from kubernetes import client, config # Importowanie klienta Kubernetes do interakcji z klasterem
+
+app = Flask(__name__) # Inicjalizacja aplikacji Flask
+
+def get_data(): # Funkcja do pobierania danych z bazy
+    conn = psycopg2.connect(dbname='yourdbname', user='yourdbuser', password='yourdbpassword', host='postgres-service') # Nawiązywanie połączenia z bazą danych
+    cur = conn.cursor() # Utworzenie kursora do wykonywania operacji na bazie
+    cur.execute("SELECT data FROM examples") # Wykonanie zapytania SQL
+    rows = cur.fetchall() # Pobranie wszystkich wyników zapytania
+    cur.close() # Zamknięcie kursora
+    conn.close() # Zamknięcie połączenia z bazą
+    return rows # Zwrócenie wyników
+
+def delete_postgres_pod(): # Funkcja do usuwania poda PostgreSQL
+    config.load_incluster_config() # Ładowanie konfiguracji klienta Kubernetes działającego wewnątrz klastra
+    v1 = client.CoreV1Api() # Utworzenie instancji API do zarządzania podami
+    namespace = "default" # Przestrzeń nazw, w której działamy
+    label_selector = "app=postgres" # Selektor etykiet do identyfikacji podów PostgreSQL
+
+    pods = v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items # Pobranie listy podów
+    for pod in pods: # Iteracja po wszystkich podach
+        print(f"Deleting pod: {pod.metadata.name}") # Logowanie informacji o usuwaniu poda
+        v1.delete_namespaced_pod(name=pod.metadata.name, namespace=namespace) # Usuwanie poda
+
+@app.route('/') # Definicja głównej ścieżki aplikacji
+def homepage(): # Funkcja obsługująca główną stronę
+    data = get_data() # Pobranie danych z bazy
+    data_list = "<ul>" + "".join([f"<li>{row[0]}</li>" for row in data]) + "</ul>" # Przygotowanie danych do wyświetlenia w formacie HTML
+    return render_template_string("""
+        <h1>Przycisk do 'zabijania' bazy danych</h1>
+        <form action="/kill-db" method="post">
+            <input type="submit" value="Zabij bazę danych" />
+        </form>
+        <h2>Dane z bazy:</h2>
+        """ + data_list) # Renderowanie szablonu HTML z danymi
+
+@app.route('/kill-db', methods=['POST']) # Definicja ścieżki do 'zabijania' bazy danych
+def kill_db(): # Funkcja obsługująca żądanie 'zabijania' bazy danych
+    delete_postgres_pod() # Usunięcie poda bazy danych
+    return 'PostgreSQL pod deletion initiated. It will be restarted automatically.' # Komunikat o inicjacji usunięcia poda
+
+if __name__ == '__main__': # Sprawdzenie, czy plik jest uruchamiany bezpośrednio
+    app.run(debug=True, host='0.0.0.0') # Uruchomienie aplikacji z opcją debugowania i dostępem z zewnątrz
+
+EOF
+
+# Lista zależności Pythona dla naszej aplikacji
+cat <<EOF > k3s-files/requirements.txt
+flask
+psycopg2-binary
+kubernetes
+EOF
+
+# Instalacja Podman, alternatywy dla Docker
+sudo apt-get update && sudo apt-get install -y podman
+
+# Przejście do katalogu z naszym projektem, budowa obrazu Dockerowego za pomocą Podman, zapisanie go i zaimportowanie do k3s
+cd k3s-files
+podman build -t moja-webapp:latest .
+podman save moja-webapp:latest > ../moja-webapp.tar
+sudo k3s ctr images import ../moja-webapp.tar
+
+# Powrót do katalogu głównego i zastosowanie konfiguracji Kubernetes
+kubectl apply -f postgresql-pv.yaml
+kubectl apply -f postgresql-pvc.yaml
+kubectl apply -f postgresql-deployment.yaml
+kubectl apply -f postgresql-service.yaml
+kubectl apply -f role.yaml
+kubectl apply -f rolebinding.yaml
+kubectl apply -f serviceaccount.yaml
+kubectl apply -f webapp-deployment.yaml
+kubectl apply -f webapp-service.yaml
+
+# Pobranie nazwy poda PostgreSQL
+POSTGRES_POD=$(kubectl get pod -l app=postgres -o jsonpath="{.items[0].metadata.name}")
+echo "Nazwa poda PostgreSQL: $POSTGRES_POD"
+
+# Sprawdzanie gotowości bazy danych PostgreSQL...
+ATTEMPTS=0
+MAX_ATTEMPTS=10 # Maksymalna liczba prób
+until kubectl exec $POSTGRES_POD -- psql -U yourdbuser -d yourdbname -c "\l" &> /dev/null || [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; do
+  ATTEMPTS=$((ATTEMPTS+1))
+  echo "Próba $ATTEMPTS/$MAX_ATTEMPTS: PostgreSQL nie jest jeszcze gotowy. Ponowne sprawdzanie za 10 sekund..."
+  sleep 10
+done
+
+if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+  echo "Nie udało się nawiązać połączenia z bazą danych PostgreSQL w wyznaczonym czasie."
+  exit 1
+else
+  echo "PostgreSQL jest gotowy. Kontynuacja konfiguracji bazy danych..."
+fi
+
+# Tworzenie tabeli i wstawianie danych
+kubectl exec $POSTGRES_POD -- psql -U yourdbuser -d yourdbname -c "CREATE TABLE examples (data TEXT);"
+kubectl exec $POSTGRES_POD -- psql -U yourdbuser -d yourdbname -c "INSERT INTO examples (data) VALUES ('Przykładowy wpis 1'), ('Przykładowy wpis 2');"
+
+echo "Konfiguracja bazy danych i początkowych danych zakończona."
